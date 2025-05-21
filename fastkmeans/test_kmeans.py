@@ -398,3 +398,68 @@ def test_euclidean_kmeans_basic(config, default_device_str):
     assert labels.shape == (n_samples,)
     assert labels.min() >= 0
     assert labels.max() < k
+
+
+@pytest.mark.parametrize("config", param_configs)
+def test_spherical_kmeans_zero_norm_vectors(config, default_device_str):
+    if config["use_triton"] and not CUDA_AVAILABLE:
+        pytest.skip("Triton test requires CUDA.")
+    if config["device_str"] == "cuda" and not CUDA_AVAILABLE:
+        pytest.skip("CUDA test requires CUDA.")
+    if config["dtype"] == torch.float16 and config["device_str"] == "cpu":
+        pytest.skip("FP16 is not well supported on CPU for this test.")
+        
+    device = _get_device(config["device_str"])
+    if config["dtype"] == torch.float16 and device.type == "cuda" and not torch.cuda.is_bf16_supported():
+         pytest.skip(f"Device {device} does not support float16/bfloat16 sufficiently for this test.")
+
+    X = np.array([
+        [1.0, 1.0], 
+        [0.0, 0.0], 
+        [2.0, 2.0], 
+        [0.0, 0.0], 
+        [3.0, 3.0],
+        [0.0, 0.0], # Add more zero vectors to increase chance of a zero centroid
+        [0.0, 0.0]
+    ], dtype=np.float32)
+    
+    n_features = X.shape[1]
+    k = 2 # Keep k small
+
+    # Epsilon from model constructor will be used (default 1e-8)
+    model = FastKMeans(
+        d=n_features,
+        k=k,
+        metric=config["metric"], # Should be "cosine" from param_configs
+        use_triton=config["use_triton"],
+        device=config["device_str"],
+        dtype=config["dtype"],
+        niter=10, # Allow a few iterations
+        seed=42 # For reproducibility
+    )
+    
+    model.train(X)
+
+    assert model.centroids is not None
+    assert not np.isnan(model.centroids).any(), "Centroids contain NaN values"
+    assert not np.isinf(model.centroids).any(), "Centroids contain Inf values"
+
+    default_epsilon = 1e-8 # This is the default in FastKMeans constructor
+    atol_norm_check = 1e-5 if config["dtype"] == torch.float32 else 1e-2
+    
+    for i in range(model.centroids.shape[0]):
+        centroid = model.centroids[i]
+        norm = np.linalg.norm(centroid)
+        # A centroid can be zero if all points assigned to it were zero-norm vectors.
+        # Or it can be normalized to 1.
+        is_zero_centroid = np.allclose(norm, 0.0, atol=default_epsilon * 10) # Check if norm is very small
+        is_normalized_centroid = np.allclose(norm, 1.0, atol=atol_norm_check)
+        
+        assert is_zero_centroid or is_normalized_centroid, \
+            f"Centroid {i} is neither zero-norm nor L2-normalized to 1.0. Norm: {norm}"
+
+    labels = model.predict(X)
+    assert labels.shape[0] == X.shape[0], "Predict returned incorrect number of labels"
+    assert not np.isnan(labels).any(), "Labels contain NaN values" # Should be int, but good check
+    assert not np.isinf(labels).any(), "Labels contain Inf values" # Should be int, but good check
+    assert np.all(labels >= 0) and np.all(labels < k), "Labels out of expected range [0, k-1]"

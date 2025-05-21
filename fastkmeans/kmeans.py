@@ -52,6 +52,7 @@ def _kmeans_torch_double_chunked(
     verbose: bool = False,
     use_triton: bool | None = None,
     metric: str = "euclidean",
+    epsilon: float = 1e-8,
 ):
     """
     An efficient kmeans implementation that minimises OOM risks on modern hardware by using conversative double chunking.
@@ -92,6 +93,9 @@ def _kmeans_torch_double_chunked(
         - "euclidean": Standard Euclidean distance. `data_norms` is utilized.
         - "cosine": Cosine similarity based distance (1 - cosine_similarity). Input `data` and initial
           centroids are L2 normalized. Subsequent centroid updates are also normalized. `data_norms` is ignored.
+    epsilon : float, default=1e-8
+        Small value to add to the denominator during L2 normalization to prevent division by zero,
+        especially for zero-norm vectors when `metric` is "cosine".
 
     Returns
     -------
@@ -123,17 +127,17 @@ def _kmeans_torch_double_chunked(
     if n_samples < k:
         raise ValueError(f"Number of training points ({n_samples}) is less than k ({k}).")
 
-    epsilon = 1e-8
+    # Epsilon is now passed as a parameter
     if metric == "cosine":
         data_norm = torch.linalg.norm(data, dim=1, keepdim=True)
-        data = data / (data_norm + epsilon)
+        data = data / (data_norm + epsilon) # Use passed epsilon
 
     # centroid init -- random is the only supported init
     rand_indices = torch.randperm(n_samples)[:k]
     centroids = data[rand_indices].clone().to(device=device, dtype=dtype)
     if metric == "cosine":
         centroid_norm = torch.linalg.norm(centroids, dim=1, keepdim=True)
-        centroids = centroids / (centroid_norm + epsilon)
+        centroids = centroids / (centroid_norm + epsilon) # Use passed epsilon
     prev_centroids = centroids.clone()
 
     labels = torch.empty(n_samples, dtype=torch.int64, device="cpu")  # Keep labels on CPU
@@ -198,8 +202,9 @@ def _kmeans_torch_double_chunked(
         new_centroids[non_empty] = (cluster_sums[non_empty] / cluster_counts[non_empty].unsqueeze(1)).to(dtype=dtype)
         
         if metric == "cosine":
-            new_centroids_norm = torch.linalg.norm(new_centroids[non_empty], dim=1, keepdim=True)
-            new_centroids[non_empty] = new_centroids[non_empty] / (new_centroids_norm + epsilon)
+            if new_centroids[non_empty].numel() > 0: # Ensure there are non-empty centroids to normalize
+                new_centroids_norm = torch.linalg.norm(new_centroids[non_empty], dim=1, keepdim=True)
+                new_centroids[non_empty] = new_centroids[non_empty] / (new_centroids_norm + epsilon) # Use passed epsilon
 
 
         empty_ids = (~non_empty).nonzero(as_tuple=True)[0]
@@ -207,8 +212,9 @@ def _kmeans_torch_double_chunked(
             reinit_indices = torch.randint(0, n_samples, (len(empty_ids),), device="cpu")
             random_data = data[reinit_indices].to(device=device, dtype=dtype, non_blocking=True)
             if metric == "cosine": # ensure reinitialized centroids are normalized
-                random_data_norm = torch.linalg.norm(random_data, dim=1, keepdim=True)
-                random_data = random_data / (random_data_norm + epsilon)
+                if random_data.numel() > 0: # Ensure there is data to normalize
+                    random_data_norm = torch.linalg.norm(random_data, dim=1, keepdim=True)
+                    random_data = random_data / (random_data_norm + epsilon) # Use passed epsilon
             new_centroids[empty_ids] = random_data
 
         if metric == "euclidean":
@@ -321,6 +327,7 @@ class FastKMeans:
         nredo: int = 1,  # for compatibility only
         use_triton: bool | None = None,
         metric: str = "euclidean",
+        epsilon: float = 1e-8,
     ):
         self.d = d
         self.k = k
@@ -344,6 +351,7 @@ class FastKMeans:
         if nredo != 1:
             raise ValueError("nredo must be 1, redos not currently supported")
         self.metric = metric
+        self.epsilon = epsilon
 
     def train(self, data: np.ndarray):
         """
@@ -360,10 +368,9 @@ class FastKMeans:
         # Move data to PyTorch CPU Tensor
         data_torch = torch.from_numpy(data)
         
-        epsilon = 1e-8
         if self.metric == "cosine":
             data_norm = torch.linalg.norm(data_torch, dim=1, keepdim=True)
-            data_torch = data_torch / (data_norm + epsilon)
+            data_torch = data_torch / (data_norm + self.epsilon) # Use self.epsilon
             # data_norms_torch is not used for cosine, initialize to empty or zeros
             data_norms_torch = torch.empty(data_torch.shape[0], device=data_torch.device, dtype=data_torch.dtype)
         elif self.metric == "euclidean":
@@ -392,6 +399,7 @@ class FastKMeans:
             verbose=self.verbose,
             use_triton=self.use_triton,
             metric=self.metric,
+            epsilon=self.epsilon, # Pass self.epsilon
         )
         self.centroids = centroids.numpy()
 
@@ -414,10 +422,9 @@ class FastKMeans:
             raise RuntimeError("Must call train() or fit() before predict().")
 
         data_torch = torch.from_numpy(data)
-        epsilon = 1e-8
         if self.metric == "cosine":
             data_norm = torch.linalg.norm(data_torch, dim=1, keepdim=True)
-            data_torch = data_torch / (data_norm + epsilon)
+            data_torch = data_torch / (data_norm + self.epsilon) # Use self.epsilon
             # data_norms_torch is not used for cosine
             data_norms_torch = torch.empty(data_torch.shape[0], device=data_torch.device, dtype=data_torch.dtype) 
         elif self.metric == "euclidean":
@@ -430,7 +437,7 @@ class FastKMeans:
         centroids_torch = torch.from_numpy(self.centroids)
         if self.metric == "cosine":
             centroid_norm = torch.linalg.norm(centroids_torch, dim=1, keepdim=True)
-            centroids_torch = centroids_torch / (centroid_norm + epsilon)
+            centroids_torch = centroids_torch / (centroid_norm + self.epsilon) # Use self.epsilon
         
         centroids_torch = centroids_torch.to(device=self.device, dtype=torch.float32)
         
