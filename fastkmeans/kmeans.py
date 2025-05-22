@@ -37,6 +37,90 @@ def _is_bfloat16_supported(device: torch.device):
         return False
 
 
+def _kmeans_plusplus_init(data: torch.Tensor, k: int, device: torch.device, seed: int) -> torch.Tensor:
+    """
+    KMeans++ initialization.
+
+    Parameters
+    ----------
+    data : torch.Tensor
+        Input data of shape (n_samples, n_features) on the target device.
+    k : int
+        Number of centroids to select.
+    device : torch.device
+        The device where the centroids should be.
+    seed : int
+        Random seed.
+
+    Returns
+    -------
+    torch.Tensor
+        The k centroids, shape (k, n_features), on the specified device and with the same dtype as data.
+    """
+    torch.manual_seed(seed)
+    n_samples, n_features = data.shape
+    centroids = torch.empty((k, n_features), dtype=data.dtype, device=device)
+
+    # 1. Select the first centroid randomly
+    first_centroid_idx = torch.randint(n_samples, (1,)).item()
+    centroids[0] = data[first_centroid_idx]
+
+    if k == 1:
+        return centroids
+
+    # 2. For each of the remaining k-1 centroids
+    for i in range(1, k):
+        # a. For each data point, calculate its squared Euclidean distance to the *nearest* already selected centroid
+        # Equivalent to: dists_sq = torch.cdist(data, centroids[:i]).min(dim=1).values ** 2
+        # but cdist can be slow for large data, manual computation is often faster and uses less memory
+        
+        # Expand centroids[:i] and data for broadcasting
+        # data shape: (n_samples, n_features)
+        # centroids_so_far shape: (i, n_features)
+        # We want to compute distances from each point in data to each centroid in centroids_so_far
+        
+        # (n_samples, 1, n_features) - (1, i, n_features) -> (n_samples, i, n_features)
+        diffs = data.unsqueeze(1) - centroids[:i].unsqueeze(0)
+        dists_sq_all_centroids = (diffs ** 2).sum(dim=2) # (n_samples, i)
+        
+        min_dists_sq, _ = torch.min(dists_sq_all_centroids, dim=1) # (n_samples,)
+
+        # b. Select the next centroid from the data points with probability proportional to D_sq(x)
+        if torch.all(min_dists_sq == 0):
+            # This can happen if k is larger than the number of unique points
+            # or if points are chosen that are identical to existing centroids.
+            # In this case, pick remaining centroids randomly to avoid errors with multinomial.
+            # It might be better to pick from points that are not yet centroids,
+            # but random selection is simpler and robust.
+            num_remaining_centroids = k - i
+            random_indices = torch.randperm(n_samples, device=device)[:num_remaining_centroids]
+            centroids[i:] = data[random_indices]
+            break # Exit the loop as all remaining centroids are filled
+
+        # Ensure probabilities are not zero for all points, can happen if some points are identical.
+        # Add a small epsilon if all distances are zero to avoid issues with multinomial if all dists are 0.
+        # However, the `if torch.all(min_dists_sq == 0)` check above should handle this.
+        # If min_dists_sq sums to 0, it means all points are identical to chosen centroids,
+        # this case is handled. If not all are zero, but some are, multinomial handles it.
+
+        probabilities = min_dists_sq / torch.sum(min_dists_sq)
+        
+        # Check for NaN or Inf in probabilities which can occur if min_dists_sq contains NaNs or Infs,
+        # or if sum is zero.
+        if torch.isnan(probabilities).any() or torch.isinf(probabilities).any() or torch.sum(min_dists_sq) == 0:
+            # Fallback to random sampling if probabilities are problematic
+            # This could happen if all points are identical to centroids already selected.
+            num_remaining_centroids = k - i
+            random_indices = torch.randperm(n_samples, device=device)[:num_remaining_centroids]
+            centroids[i:] = data[random_indices]
+            break
+
+        next_centroid_idx = torch.multinomial(probabilities, 1).item()
+        centroids[i] = data[next_centroid_idx]
+
+    return centroids
+
+
 @torch.inference_mode()
 def _kmeans_torch_double_chunked(
     data: torch.Tensor,
@@ -51,9 +135,42 @@ def _kmeans_torch_double_chunked(
     max_points_per_centroid: int = 256,
     verbose: bool = False,
     use_triton: bool | None = None,
+    init_method: str = "random",
+    seed: int = 0,
 ):
     """
     An efficient kmeans implementation that minimises OOM risks on modern hardware by using conversative double chunking.
+
+    Parameters
+    ----------
+    data : torch.Tensor
+        Input data tensor.
+    data_norms : torch.Tensor
+        Squared L2 norms of the input data.
+    k : int
+        Number of clusters.
+    device : torch.device
+        Target device for computation.
+    dtype : torch.dtype | None, default=None
+        Target dtype for computation.
+    max_iters : int, default=25
+        Maximum number of iterations.
+    tol : float, default=1e-8
+        Tolerance for convergence.
+    chunk_size_data : int, default=50_000
+        Chunk size for data processing.
+    chunk_size_centroids : int, default=10_000
+        Chunk size for centroid processing.
+    max_points_per_centroid : int, default=256
+        Maximum points per centroid for subsampling.
+    verbose : bool, default=False
+        Enable verbose logging.
+    use_triton : bool | None, default=None
+        Enable Triton kernels.
+    init_method : str, default='random'
+        Centroid initialization method ('random' or 'kmeans++').
+    seed : int, default=0
+        Random seed for initialization.
 
     Returns
     -------
@@ -84,9 +201,31 @@ def _kmeans_torch_double_chunked(
     if n_samples < k:
         raise ValueError(f"Number of training points ({n_samples}) is less than k ({k}).")
 
-    # centroid init -- random is the only supported init
-    rand_indices = torch.randperm(n_samples)[:k]
-    centroids = data[rand_indices].clone().to(device=device, dtype=dtype)
+    # Centroid initialization
+    if init_method == "kmeans++":
+        # Data for _kmeans_plusplus_init should be on the target device
+        data_for_init = data.to(device=device, dtype=dtype if dtype is not None else data.dtype)
+        centroids = _kmeans_plusplus_init(data_for_init, k, device, seed)
+        # Ensure centroids are correctly typed and on device, _kmeans_plusplus_init should handle this, but being explicit.
+        centroids = centroids.to(device=device, dtype=dtype)
+    elif init_method == "random":
+        # Ensure randperm happens on the device of the data if data is still on CPU
+        # or on the target device if data has already been moved.
+        # Since `data` at this point is the (potentially subsampled) data, which might be on CPU or GPU,
+        # and `device` is the target computation device.
+        # For simplicity and consistency, let's ensure data is on the target device before randperm if it's used for indexing.
+        data_on_target_device = data.to(device=device)
+        rand_indices = torch.randperm(n_samples, device=device)[:k]
+        centroids = data_on_target_device[rand_indices].clone().to(device=device, dtype=dtype)
+    else:
+        # Fallback or error for unknown init_method, though FastKMeans class should prevent this.
+        # For now, let's default to random for safety if an unexpected value gets here.
+        # This case should ideally not be reached if FastKMeans validates `init`.
+        torch.manual_seed(seed) # Ensure seed is respected for random init
+        data_on_target_device = data.to(device=device)
+        rand_indices = torch.randperm(n_samples, device=device)[:k]
+        centroids = data_on_target_device[rand_indices].clone().to(device=device, dtype=dtype)
+
     prev_centroids = centroids.clone()
 
     labels = torch.empty(n_samples, dtype=torch.int64, device="cpu")  # Keep labels on CPU
@@ -198,6 +337,8 @@ class FastKMeans:
     use_triton : bool | None, default=None
        Use the fast Triton backend for the assignment/update steps.
        If None, the Triton backend will be enabled for modern GPUs.
+    init : str, default='random'
+        Method for centroid initialization. Valid options are 'random' and 'kmeans++'.
     """
 
     def __init__(
@@ -217,6 +358,7 @@ class FastKMeans:
         verbose: bool = False,
         nredo: int = 1,  # for compatibility only
         use_triton: bool | None = None,
+        init: str = "random",
     ):
         self.d = d
         self.k = k
@@ -239,6 +381,9 @@ class FastKMeans:
         self.use_triton = use_triton
         if nredo != 1:
             raise ValueError("nredo must be 1, redos not currently supported")
+        if init not in ["random", "kmeans++"]:
+            raise ValueError(f"Invalid init method: {init}. Valid options are 'random' and 'kmeans++'.")
+        self.init = init
 
     def train(self, data: np.ndarray):
         """
@@ -274,6 +419,8 @@ class FastKMeans:
             max_points_per_centroid=self.max_points_per_centroid,
             verbose=self.verbose,
             use_triton=self.use_triton,
+            init_method=self.init,
+            seed=self.seed,
         )
         self.centroids = centroids.numpy()
 
